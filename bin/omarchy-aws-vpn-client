@@ -1,0 +1,619 @@
+#!/usr/bin/env python3
+# omarchy:summary=AWS Client VPN with SAML/SSO — profiles, connect, status.
+# omarchy:args=<status|list|add|remove|default|connect|disconnect|toggle|discover|logs>
+"""
+omarchy-aws-vpn-client — AWS Client VPN control for the Omarchy bar.
+
+Drives the openlawsvpn system daemon over D-Bus (com.openlawsvpn.Daemon).
+The daemon runs as its own user with ProtectHome=true, so it cannot read
+the user's home directory: profile *contents* are passed over the bus, not
+just a path.
+
+SAML/SSO flow:
+  1. Connect() is called with the .ovpn contents.
+  2. The daemon completes OpenVPN phase 1, stands up an ACS server on
+     127.0.0.1:35001, and emits SAMLRequired(url).
+  3. This tool opens the default browser at that URL; the user logs in via
+     their IdP, which POSTs the SAMLResponse back to the ACS server.
+  4. The daemon uses the assertion for phase 2 and the tunnel comes up.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+APP = "omarchy-aws-vpn-client"
+BUS_NAME = "com.openlawsvpn.Daemon"
+BUS_PATH = "/com/openlawsvpn/Daemon"
+BUS_IFACE = "com.openlawsvpn.Daemon"
+
+CONFIG_DIR = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "omarchy",
+    "aws-vpn-client",
+)
+PROFILE_DIR = os.path.join(CONFIG_DIR, "profiles")
+STORE = os.path.join(CONFIG_DIR, "profiles.json")
+
+# Where `discover` looks for .ovpn files the user has downloaded.
+DISCOVER_DIRS = ["~/Downloads", "~/Documents", "~/Desktop", "~"]
+
+# Overall ceiling for the connect watch loop. The daemon's own SAML wait
+# times out well before this; this only bounds our observation of it.
+CONNECT_TIMEOUT = 300
+
+
+# --------------------------------------------------------------------------
+# small helpers
+# --------------------------------------------------------------------------
+
+def die(msg, code=1):
+    print(f"{APP}: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def notify(title, body="", urgency="normal", icon="network-vpn"):
+    if not shutil.which("notify-send"):
+        return
+    subprocess.run(
+        ["notify-send", "-a", "AWS VPN", "-u", urgency, "-i", icon, title, body],
+        check=False,
+    )
+
+
+def ensure_dirs():
+    os.makedirs(PROFILE_DIR, mode=0o700, exist_ok=True)
+    # Tighten if the tree predates this tool.
+    for d in (CONFIG_DIR, PROFILE_DIR):
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------
+# profile store
+# --------------------------------------------------------------------------
+
+def load_store():
+    if not os.path.exists(STORE):
+        return {"default": "", "profiles": []}
+    try:
+        with open(STORE) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {"default": "", "profiles": []}
+    data.setdefault("default", "")
+    data.setdefault("profiles", [])
+    return data
+
+
+def save_store(data):
+    ensure_dirs()
+    tmp = STORE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STORE)
+
+
+def find_profile(data, name):
+    for p in data["profiles"]:
+        if p["name"] == name:
+            return p
+    return None
+
+
+def resolve_profile(data, name=None):
+    """Pick the named profile, else the default, else the only one."""
+    if name:
+        p = find_profile(data, name)
+        if not p:
+            die(f"no such profile: {name}")
+        return p
+    if data["default"]:
+        p = find_profile(data, data["default"])
+        if p:
+            return p
+    if len(data["profiles"]) == 1:
+        return data["profiles"][0]
+    if not data["profiles"]:
+        die("no profiles configured — add one with: omarchy-aws-vpn-client add <file.ovpn>")
+    die("multiple profiles and no default set — pass a name or run: omarchy-aws-vpn-client default <name>")
+
+
+def slugify(text):
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", text).strip("-")
+    return slug or "profile"
+
+
+def read_profile_content(profile):
+    path = os.path.expanduser(profile["path"])
+    try:
+        with open(path) as fh:
+            return fh.read()
+    except OSError as exc:
+        die(f"cannot read profile {profile['name']}: {exc}")
+
+
+def endpoint_of(content):
+    """Pull the remote host out of an .ovpn for display."""
+    m = re.search(r"^\s*remote\s+(\S+)", content, re.MULTILINE)
+    return m.group(1) if m else ""
+
+
+def validate_ovpn(content, path):
+    if "remote " not in content:
+        die(f"{path} does not look like an OpenVPN profile (no 'remote' line)")
+    if "auth-federate" not in content:
+        print(
+            f"{APP}: warning: {path} has no 'auth-federate' directive — "
+            "this may not be a SAML/SSO-enabled AWS Client VPN profile.",
+            file=sys.stderr,
+        )
+
+
+# --------------------------------------------------------------------------
+# D-Bus
+# --------------------------------------------------------------------------
+
+def gdbus_call(method, *args):
+    cmd = [
+        "gdbus", "call", "--system",
+        "--dest", BUS_NAME,
+        "--object-path", BUS_PATH,
+        "--method", f"{BUS_IFACE}.{method}",
+    ] + list(args)
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        err = proc.stderr.strip()
+        if "NameHasNoOwner" in err or "ServiceUnknown" in err:
+            die(
+                "openlawsvpn daemon is not running.\n"
+                "  Start it with: systemctl start openlawsvpn-daemon"
+            )
+        if ".Busy" in err:
+            die("a VPN connection is already active — disconnect first")
+        die(f"D-Bus {method} failed: {err}")
+    return proc.stdout.strip()
+
+
+# gdbus prints GVariant tuples: ('idle', '', '', '')
+_GV_STRING = re.compile(r"'((?:[^'\\]|\\.)*)'")
+
+
+def gv_unescape(s):
+    return s.replace("\\'", "'").replace("\\\\", "\\")
+
+
+def parse_gv_strings(text):
+    return [gv_unescape(m) for m in _GV_STRING.findall(text)]
+
+
+def daemon_status():
+    """Return (state, server_ip, assigned_ip, profile_path)."""
+    out = gdbus_call("Status")
+    parts = parse_gv_strings(out)
+    while len(parts) < 4:
+        parts.append("")
+    return parts[0], parts[1], parts[2], parts[3]
+
+
+def daemon_running():
+    proc = subprocess.run(
+        ["systemctl", "is-active", "--quiet", "openlawsvpn-daemon"], check=False
+    )
+    return proc.returncode == 0
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+def cmd_status(args):
+    data = load_store()
+
+    if not daemon_running():
+        info = {
+            "state": "daemon-down",
+            "label": "Daemon stopped",
+            "profile": "",
+            "server_ip": "",
+            "assigned_ip": "",
+            "profiles": len(data["profiles"]),
+        }
+    else:
+        state, server_ip, assigned_ip, profile_path = daemon_status()
+        name = ""
+        for p in data["profiles"]:
+            if os.path.expanduser(p["path"]) == profile_path:
+                name = p["name"]
+                break
+        if not name and profile_path:
+            name = os.path.basename(profile_path)
+        labels = {
+            "idle": "Disconnected",
+            "connecting": "Connecting…",
+            "waiting_saml": "Waiting for SSO login…",
+            "connected": "Connected",
+            "disconnecting": "Disconnecting…",
+            "error": "Error",
+        }
+        info = {
+            "state": state,
+            "label": labels.get(state, state),
+            "profile": name,
+            "server_ip": server_ip,
+            "assigned_ip": assigned_ip,
+            "profiles": len(data["profiles"]),
+        }
+
+    if args.json:
+        print(json.dumps(info))
+    else:
+        line = info["label"]
+        if info["profile"]:
+            line += f" ({info['profile']})"
+        print(line)
+        if info["assigned_ip"]:
+            print(f"  tunnel IP: {info['assigned_ip']}")
+        if info["server_ip"]:
+            print(f"  server:    {info['server_ip']}")
+    return 0
+
+
+def cmd_list(args):
+    data = load_store()
+    if args.json:
+        print(json.dumps({
+            "default": data["default"],
+            "profiles": data["profiles"],
+        }))
+        return 0
+    if not data["profiles"]:
+        print("No profiles. Add one with: omarchy-aws-vpn-client add <file.ovpn>")
+        return 0
+    for p in data["profiles"]:
+        mark = "*" if p["name"] == data["default"] else " "
+        endpoint = f"  [{p['endpoint']}]" if p.get("endpoint") else ""
+        print(f"{mark} {p['name']}{endpoint}\n    {p['path']}")
+    return 0
+
+
+def cmd_add(args):
+    src = os.path.abspath(os.path.expanduser(args.path))
+    if not os.path.isfile(src):
+        die(f"no such file: {src}")
+
+    try:
+        with open(src) as fh:
+            content = fh.read()
+    except OSError as exc:
+        die(f"cannot read {src}: {exc}")
+
+    validate_ovpn(content, src)
+
+    data = load_store()
+    name = args.name or slugify(os.path.splitext(os.path.basename(src))[0])
+    if find_profile(data, name):
+        die(f"profile {name!r} already exists — remove it first or pass --name")
+
+    if args.link:
+        # Point at the file where it already lives.
+        path = src
+    else:
+        # Import a private copy so the profile survives the download being
+        # cleaned up, and is readable only by this user.
+        ensure_dirs()
+        path = os.path.join(PROFILE_DIR, f"{name}.ovpn")
+        with open(path, "w") as fh:
+            fh.write(content)
+        os.chmod(path, 0o600)
+
+    entry = {
+        "name": name,
+        "path": path,
+        # Remember where an imported copy came from, so `discover` stops
+        # offering the original as a fresh import.
+        "source": src,
+        "linked": bool(args.link),
+        "endpoint": endpoint_of(content),
+    }
+    data["profiles"].append(entry)
+    if not data["default"]:
+        data["default"] = name
+    save_store(data)
+
+    verb = "linked" if args.link else "imported"
+    print(f"{verb} profile {name!r} -> {path}")
+    return 0
+
+
+def cmd_remove(args):
+    data = load_store()
+    p = find_profile(data, args.name)
+    if not p:
+        die(f"no such profile: {args.name}")
+    data["profiles"] = [x for x in data["profiles"] if x["name"] != args.name]
+    if data["default"] == args.name:
+        data["default"] = data["profiles"][0]["name"] if data["profiles"] else ""
+    save_store(data)
+    # Only delete copies this tool made; never touch a file the user pointed at.
+    if not p.get("linked"):
+        try:
+            os.remove(os.path.expanduser(p["path"]))
+        except OSError:
+            pass
+    print(f"removed profile {args.name!r}")
+    return 0
+
+
+def cmd_default(args):
+    data = load_store()
+    if not find_profile(data, args.name):
+        die(f"no such profile: {args.name}")
+    data["default"] = args.name
+    save_store(data)
+    print(f"default profile is now {args.name!r}")
+    return 0
+
+
+def cmd_discover(args):
+    """List .ovpn files lying around, for the panel's import picker."""
+    known = set()
+    for p in load_store()["profiles"]:
+        known.add(os.path.expanduser(p["path"]))
+        if p.get("source"):
+            known.add(os.path.expanduser(p["source"]))
+    found = []
+    seen = set()
+    for d in DISCOVER_DIRS:
+        base = os.path.expanduser(d)
+        if not os.path.isdir(base):
+            continue
+        try:
+            entries = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.lower().endswith(".ovpn"):
+                continue
+            full = os.path.join(base, entry)
+            if full in seen or full in known or not os.path.isfile(full):
+                continue
+            seen.add(full)
+            found.append({
+                "name": entry,
+                "path": full,
+                "dir": base,
+                "mtime": int(os.path.getmtime(full)),
+            })
+    found.sort(key=lambda x: -x["mtime"])
+    if args.json:
+        print(json.dumps({"files": found}))
+    else:
+        for f in found:
+            print(f["path"])
+    return 0
+
+
+def open_browser(url):
+    """Open the SAML URL in the user's default browser and focus it."""
+    launcher = shutil.which("omarchy-launch-browser")
+    cmd = [launcher, url] if launcher else ["xdg-open", url]
+    try:
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except OSError:
+        return False
+
+
+def cmd_connect(args):
+    data = load_store()
+    profile = resolve_profile(data, args.name)
+
+    if not daemon_running():
+        die(
+            "openlawsvpn daemon is not running.\n"
+            "  Start it with: systemctl start openlawsvpn-daemon"
+        )
+
+    state, _, _, _ = daemon_status()
+    if state in ("connected", "connecting", "waiting_saml"):
+        die(f"already {state} — disconnect first")
+
+    content = read_profile_content(profile)
+    path = os.path.expanduser(profile["path"])
+
+    # Subscribe before calling Connect: SAMLRequired can arrive within
+    # milliseconds of phase 1 completing, and a signal missed is a login
+    # prompt that never opens.
+    monitor = subprocess.Popen(
+        ["gdbus", "monitor", "--system", "--dest", BUS_NAME],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
+    # Give gdbus a moment to actually establish the match rule.
+    time.sleep(0.4)
+
+    try:
+        gdbus_call("Connect", path, content)
+    except SystemExit:
+        monitor.terminate()
+        raise
+
+    notify("AWS VPN", f"Connecting to {profile['name']}…")
+    print(f"connecting to {profile['name']}…")
+
+    rc = watch_connect(monitor, profile)
+    monitor.terminate()
+    try:
+        monitor.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        monitor.kill()
+    return rc
+
+
+def watch_connect(monitor, profile):
+    """Follow daemon signals until the tunnel is up, fails, or times out."""
+    deadline = time.time() + CONNECT_TIMEOUT
+    opened_browser = False
+
+    while time.time() < deadline:
+        if monitor.stdout is None:
+            break
+        line = monitor.stdout.readline()
+        if not line:
+            break
+        line = line.strip()
+
+        if ".SAMLRequired" in line:
+            urls = parse_gv_strings(line.split(".SAMLRequired", 1)[1])
+            url = urls[0] if urls else ""
+            if url and not opened_browser:
+                opened_browser = True
+                print("opening browser for SSO login…")
+                if open_browser(url):
+                    notify("AWS VPN", "Complete the SSO login in your browser.")
+                else:
+                    notify(
+                        "AWS VPN",
+                        "Could not open a browser. Open this URL manually:\n" + url,
+                        urgency="critical",
+                    )
+                    print(f"open this URL to log in:\n{url}")
+            continue
+
+        if ".StateChanged" in line:
+            parts = parse_gv_strings(line.split(".StateChanged", 1)[1])
+            state = parts[0] if parts else ""
+            # The daemon sends Message in the third slot: the assigned tunnel
+            # IP when connected, the failure reason when errored.
+            message = parts[2] if len(parts) > 2 else ""
+
+            if state == "connected":
+                detail = f"{profile['name']} · {message}" if message else profile["name"]
+                notify("AWS VPN connected", detail, icon="network-vpn")
+                print(f"connected ({profile['name']})"
+                      + (f" — tunnel IP {message}" if message else ""))
+                return 0
+            if state == "error":
+                notify("AWS VPN failed", message or "Connection failed",
+                       urgency="critical", icon="network-error")
+                print(f"connection failed: {message or 'unknown error'}",
+                      file=sys.stderr)
+                return 1
+            if state == "idle":
+                # Went back to idle without ever reaching connected.
+                notify("AWS VPN", "Connection ended", icon="network-error")
+                print("connection ended before it came up", file=sys.stderr)
+                return 1
+
+    notify("AWS VPN", "Connection timed out", urgency="critical",
+           icon="network-error")
+    print("timed out waiting for the connection", file=sys.stderr)
+    return 1
+
+
+def cmd_disconnect(args):
+    if not daemon_running():
+        die("openlawsvpn daemon is not running")
+    state, _, _, _ = daemon_status()
+    if state == "idle":
+        print("not connected")
+        return 0
+    gdbus_call("Disconnect")
+    notify("AWS VPN", "Disconnected", icon="network-offline")
+    print("disconnected")
+    return 0
+
+
+def cmd_toggle(args):
+    if not daemon_running():
+        die("openlawsvpn daemon is not running")
+    state, _, _, _ = daemon_status()
+    if state in ("connected", "connecting", "waiting_saml"):
+        return cmd_disconnect(args)
+    return cmd_connect(args)
+
+
+def cmd_logs(args):
+    os.execvp("journalctl", [
+        "journalctl", "-u", "openlawsvpn-daemon",
+        "-n", str(args.lines), "--no-pager",
+    ])
+
+
+# --------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog=APP,
+        description="AWS Client VPN with SAML/SSO for Omarchy.",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("status", help="show connection status")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("list", aliases=["profiles"], help="list profiles")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("add", help="import or point to an .ovpn profile")
+    p.add_argument("path")
+    p.add_argument("--name", help="profile name (default: file name)")
+    p.add_argument("--link", action="store_true",
+                   help="reference the file in place instead of copying it")
+    p.set_defaults(func=cmd_add)
+
+    p = sub.add_parser("remove", aliases=["rm"], help="remove a profile")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_remove)
+
+    p = sub.add_parser("default", help="set the default profile")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_default)
+
+    p = sub.add_parser("discover", help="find .ovpn files not yet added")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_discover)
+
+    p = sub.add_parser("connect", help="connect (opens browser for SSO)")
+    p.add_argument("name", nargs="?")
+    p.set_defaults(func=cmd_connect)
+
+    p = sub.add_parser("disconnect", help="tear down the tunnel")
+    p.set_defaults(func=cmd_disconnect)
+
+    p = sub.add_parser("toggle", help="connect or disconnect")
+    p.add_argument("name", nargs="?")
+    p.set_defaults(func=cmd_toggle)
+
+    p = sub.add_parser("logs", help="show daemon logs")
+    p.add_argument("-n", "--lines", type=int, default=50)
+    p.set_defaults(func=cmd_logs)
+
+    args = parser.parse_args()
+    try:
+        sys.exit(args.func(args))
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

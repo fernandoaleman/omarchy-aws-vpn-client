@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "fernandoaleman.aws-vpn-client",
+  "name": "AWS VPN Client",
+  "version": "1.0.0",
+  "author": "Fernando Aleman",
+  "license": "MIT",
+  "description": "AWS Client VPN with SAML/SSO login, profile switching, and connection status in the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "AWS VPN Client",
+    "description": "Connect to AWS Client VPN via SSO, switch profiles, and import .ovpn files.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 10
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 2,
+        "max": 3600,
+        "step": 1,
+        "defaultValue": 10
+      }
+    ]
+  }
+}
