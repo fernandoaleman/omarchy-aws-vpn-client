@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+#
+# setup — one-shot installer for omarchy-aws-vpn-client.
+#
+# Omarchy's plugin system runs nothing from a plugin repo on `plugin add`
+# (it is a clone + validate + move), and the manifest has no dependency
+# field, so anything beyond the plugin's own files has to be done here.
+#
+# Everything below is idempotent: re-running is safe and only fills in
+# whatever is missing. Use --uninstall to reverse the parts this script
+# owns (it never removes your VPN profiles).
+#
+set -euo pipefail
+
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BINDINGS="$HOME/.config/hypr/bindings.lua"
+BIN_DIR="$HOME/.local/bin"
+DROPIN_DIR="/etc/systemd/system/openlawsvpn-daemon.service.d"
+DROPIN="$DROPIN_DIR/10-execstart.conf"
+DAEMON_BIN="/usr/lib/openlawsvpn/openlawsvpn-daemon"
+MARKER_BEGIN="-- >>> omarchy-aws-vpn-client >>>"
+MARKER_END="-- <<< omarchy-aws-vpn-client <<<"
+
+bold=$'\e[1m'; green=$'\e[32m'; yellow=$'\e[33m'; red=$'\e[31m'; dim=$'\e[2m'; off=$'\e[0m'
+ok()   { echo "  ${green}✓${off} $*"; }
+skip() { echo "  ${dim}·${off} $*"; }
+warn() { echo "  ${yellow}!${off} $*"; }
+die()  { echo "  ${red}✗${off} $*" >&2; exit 1; }
+step() { echo; echo "${bold}$*${off}"; }
+
+[[ ${EUID:-$(id -u)} -ne 0 ]] || die "Run this as your normal user, not root. It calls sudo only where needed."
+
+CLI_NAME="$(basename "$(ls "$PLUGIN_DIR"/bin/* 2>/dev/null | head -1)" 2>/dev/null || true)"
+[[ -n $CLI_NAME ]] || die "No CLI found in $PLUGIN_DIR/bin — is this the plugin repo?"
+
+PLUGIN_ID="$(jq -r '.id' "$PLUGIN_DIR/manifest.json" 2>/dev/null || true)"
+[[ -n $PLUGIN_ID && $PLUGIN_ID != null ]] || die "Could not read plugin id from $PLUGIN_DIR/manifest.json"
+
+# ---------------------------------------------------------------------------
+usage() {
+  cat <<EOF
+Usage: ./setup [--uninstall] [--no-keybind] [--key "SUPER + SHIFT + V"]
+
+  (no args)     Install the VPN daemon, fix its unit, link the CLI onto
+                PATH, add a keybinding, and enable the bar widget.
+  --uninstall   Remove the keybinding, the PATH symlink, and the systemd
+                drop-in. Leaves the daemon package and your VPN profiles.
+  --no-keybind  Skip the keybinding step.
+  --key <combo> Use a specific key combination.
+EOF
+}
+
+MODE=install
+KEYBIND=1
+KEY_PREF=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --uninstall) MODE=uninstall ;;
+    --no-keybind) KEYBIND=0 ;;
+    --key) KEY_PREF="${2:-}"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage; die "unknown option: $1" ;;
+  esac
+  shift
+done
+
+remove_keybind_block() {
+  [[ -f $BINDINGS ]] || return 0
+  grep -qF -- "$MARKER_BEGIN" "$BINDINGS" || return 0
+  # Delete the marked block, and any single blank line left behind.
+  sed -i "\|$MARKER_BEGIN|,\|$MARKER_END|d" "$BINDINGS"
+  sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$BINDINGS"
+}
+
+# ---------------------------------------------------------------------------
+if [[ $MODE == uninstall ]]; then
+  step "Uninstalling"
+  remove_keybind_block && ok "Removed keybinding from bindings.lua"
+  if [[ -L $BIN_DIR/$CLI_NAME ]]; then rm -f "$BIN_DIR/$CLI_NAME"; ok "Removed $BIN_DIR/$CLI_NAME"; else skip "No CLI symlink to remove"; fi
+  if [[ -f $DROPIN ]]; then
+    sudo rm -f "$DROPIN"; sudo rmdir --ignore-fail-on-non-empty "$DROPIN_DIR" 2>/dev/null || true
+    sudo systemctl daemon-reload; ok "Removed systemd drop-in"
+  else skip "No systemd drop-in to remove"; fi
+  command -v hyprctl >/dev/null && hyprctl reload >/dev/null 2>&1 || true
+  echo; echo "Your VPN profiles in ~/.config/omarchy/aws-vpn-client/ were left alone."
+  echo "To remove the plugin itself:  omarchy plugin remove $PLUGIN_ID"
+  echo "To remove the daemon:         sudo pacman -Rns openlawsvpn-daemon"
+  exit 0
+fi
+
+echo "${bold}omarchy-aws-vpn-client setup${off}"
+echo "${dim}plugin: $PLUGIN_ID${off}"
+echo "${dim}dir:    $PLUGIN_DIR${off}"
+
+# --- 1. the VPN daemon ------------------------------------------------------
+step "1/5  VPN daemon (openlawsvpn-daemon)"
+if pacman -Q openlawsvpn-daemon >/dev/null 2>&1; then
+  skip "Already installed ($(pacman -Q openlawsvpn-daemon | awk '{print $2}'))"
+else
+  HELPER=""
+  for h in yay paru pikaur; do command -v "$h" >/dev/null 2>&1 && { HELPER="$h"; break; }; done
+  [[ -n $HELPER ]] || die "No AUR helper found (yay/paru/pikaur). Install one, then re-run — or build openlawsvpn-daemon manually."
+  echo "  Installing with $HELPER (this builds from source and takes a few minutes)…"
+  "$HELPER" -S --needed --noconfirm openlawsvpn-daemon
+  ok "Installed openlawsvpn-daemon"
+fi
+
+# --- 2. work around the packaging bug --------------------------------------
+step "2/5  systemd unit"
+# `systemctl show` reports the *effective* ExecStart after drop-ins are
+# merged; `systemctl cat` would show the base unit's stale path first and
+# make an already-fixed system look broken.
+UNIT_EXEC="$(systemctl show openlawsvpn-daemon.service -p ExecStart --value 2>/dev/null \
+  | sed -n 's/.*path=\([^ ;]*\).*/\1/p' | head -1)"
+if [[ -x ${UNIT_EXEC:-} ]]; then
+  skip "Unit ExecStart is valid ($UNIT_EXEC) — no workaround needed"
+elif [[ -x $DAEMON_BIN ]]; then
+  # The AUR unit points at /usr/libexec (an RPM path) while the package
+  # installs to /usr/lib/openlawsvpn, so the daemon dies with 203/EXEC.
+  # Applied as a drop-in so a future package fix supersedes it cleanly.
+  echo "  Unit points at a missing binary; applying ExecStart drop-in (needs sudo)…"
+  sudo install -d "$DROPIN_DIR"
+  sudo tee "$DROPIN" >/dev/null <<EOF
+# Added by omarchy-aws-vpn-client setup.
+# The AUR package installs the daemon to /usr/lib/openlawsvpn/ but ships a
+# unit pointing at /usr/libexec/ (an RPM path), so it fails with 203/EXEC.
+# Remove this file once the AUR package is fixed upstream.
+[Service]
+ExecStart=
+ExecStart=$DAEMON_BIN
+EOF
+  sudo systemctl daemon-reload
+  ok "Applied drop-in -> $DAEMON_BIN"
+else
+  die "Cannot find the daemon binary. Expected $DAEMON_BIN — did the package layout change?"
+fi
+
+# Only escalate when something actually needs changing, so re-running on a
+# configured machine never prompts for a password.
+if systemctl is-enabled --quiet openlawsvpn-daemon 2>/dev/null; then
+  skip "Enabled at boot"
+else
+  sudo systemctl enable openlawsvpn-daemon >/dev/null 2>&1 && ok "Enabled at boot" \
+    || warn "Could not enable at boot"
+fi
+
+if systemctl is-active --quiet openlawsvpn-daemon; then
+  skip "Daemon already running"
+else
+  sudo systemctl reset-failed openlawsvpn-daemon 2>/dev/null || true
+  sudo systemctl start openlawsvpn-daemon 2>/dev/null || true
+  sleep 1
+  systemctl is-active --quiet openlawsvpn-daemon \
+    && ok "Daemon started" \
+    || warn "Daemon is not active. Check: systemctl status openlawsvpn-daemon"
+fi
+
+# --- 3. CLI on PATH ---------------------------------------------------------
+step "3/5  CLI on PATH"
+mkdir -p "$BIN_DIR"
+ln -sfn "$PLUGIN_DIR/bin/$CLI_NAME" "$BIN_DIR/$CLI_NAME"
+ok "Linked $BIN_DIR/$CLI_NAME"
+case ":$PATH:" in
+  *":$BIN_DIR:"*) ;;
+  *) warn "$BIN_DIR is not on your PATH — add it to use the CLI from a terminal." ;;
+esac
+
+# --- 4. keybinding ----------------------------------------------------------
+step "4/5  Keybinding"
+if [[ $KEYBIND -eq 0 ]]; then
+  skip "Skipped (--no-keybind)"
+else
+  # Omarchy has no plugin-level keybinding API: user bindings live in
+  # ~/.config/hypr/bindings.lua. Write a marked block so re-running
+  # replaces rather than duplicates, and --uninstall can lift it back out.
+  BOUND="$(omarchy menu keybindings --print 2>/dev/null || true)"
+  KEY=""
+  if [[ -n $KEY_PREF ]]; then
+    KEY="$KEY_PREF"
+  else
+    for candidate in "SUPER + SHIFT + V" "SUPER + CTRL + SHIFT + V"; do
+      probe="$(echo "$candidate" | sed 's/ + / /g; s/+ //g')"
+      if ! grep -qiE "^\s*${probe// /[[:space:]]+}\b" <<<"$BOUND"; then KEY="$candidate"; break; fi
+    done
+  fi
+
+  if [[ -z $KEY ]]; then
+    warn "Both SUPER+SHIFT+V and SUPER+CTRL+SHIFT+V are taken. Re-run with: ./setup --key \"SUPER + ALT + V\""
+  else
+    remove_keybind_block
+    mkdir -p "$(dirname "$BINDINGS")"; touch "$BINDINGS"
+    cat >>"$BINDINGS" <<EOF
+
+$MARKER_BEGIN
+o.bind("$KEY", "AWS VPN", "omarchy-shell $PLUGIN_ID toggle")
+$MARKER_END
+EOF
+    if command -v hyprctl >/dev/null && hyprctl reload >/dev/null 2>&1; then
+      errs="$(hyprctl configerrors 2>/dev/null | grep -v '^ok$' || true)"
+      [[ -z ${errs//[[:space:]]/} ]] && ok "Bound $KEY" || warn "Bound $KEY, but Hyprland reported: $errs"
+    else
+      ok "Bound $KEY ${dim}(reload Hyprland to apply)${off}"
+    fi
+  fi
+fi
+
+# --- 5. enable the widget ---------------------------------------------------
+step "5/5  Bar widget"
+if omarchy plugin list 2>/dev/null | grep -q "^$PLUGIN_ID .*enabled"; then
+  skip "Already enabled"
+else
+  omarchy plugin enable "$PLUGIN_ID" right >/dev/null 2>&1 \
+    && ok "Enabled in the bar (right section)" \
+    || warn "Could not enable automatically. Run: omarchy plugin enable $PLUGIN_ID right"
+fi
+
+# --- done -------------------------------------------------------------------
+step "Done"
+if ! id -nG | tr ' ' '\n' | grep -qx openlawsvpn; then
+  echo "  ${dim}Your user was added to the 'openlawsvpn' group; it applies at your next"
+  echo "  login. Until then the daemon's D-Bus policy still allows local users.${off}"
+fi
+cat <<EOF
+
+  Next: add your AWS Client VPN profile (the SAML one, containing
+  'auth-federate'), then connect.
+
+    $CLI_NAME add ~/Downloads/your-profile.ovpn
+    $CLI_NAME connect
+
+  Or drop the .ovpn in ~/Downloads and pick it from the panel's
+  IMPORT section. Open the panel with ${KEY:-your keybinding} or the bar icon.
+EOF

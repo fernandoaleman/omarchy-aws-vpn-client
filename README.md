@@ -41,6 +41,41 @@ The tunnel is owned by a system daemon running as its own user with
 
 ## Install
 
+```bash
+omarchy plugin add https://github.com/fernandoaleman/omarchy-aws-vpn-client --enable
+~/.config/omarchy/plugins/omarchy-aws-vpn-client/setup
+```
+
+`omarchy plugin add` only clones the plugin — Omarchy runs nothing from a
+plugin repo and its manifest has no dependency field, so `setup` does the
+rest: installs the VPN daemon, works around its packaging bug, links the CLI
+onto your PATH, binds a key, and enables the bar widget.
+
+It is idempotent, so re-running only fills in what is missing.
+
+```
+./setup                          # everything
+./setup --no-keybind             # skip the keybinding
+./setup --key "SUPER + ALT + V"  # choose the combination
+./setup --uninstall              # undo the above (keeps your VPN profiles)
+```
+
+Without a keybinding argument it takes `SUPER + SHIFT + V`, falling back to
+`SUPER + CTRL + SHIFT + V` if that is already bound. The binding is written to
+`~/.config/hypr/bindings.lua` inside a marked block, so re-running replaces it
+rather than duplicating it and `--uninstall` can lift it back out. Omarchy has
+no plugin-level keybinding API — user bindings live in that file — so this is
+the same approach other plugins document manually.
+
+Then add your profile:
+
+```bash
+omarchy-aws-vpn-client add ~/Downloads/work.ovpn --name work
+```
+
+<details>
+<summary>Manual install, if you would rather not run the script</summary>
+
 ### 1. The VPN daemon
 
 ```bash
@@ -110,6 +145,8 @@ o.bind("SUPER + SHIFT + V", "AWS VPN", "omarchy-shell fernandoaleman.aws-vpn-cli
 Check the key is free first with `omarchy menu keybindings --print`; if it's
 taken, `hl.unbind("SUPER + SHIFT + V")` before the `o.bind`, or pick another
 combination such as `SUPER + CTRL + SHIFT + V`.
+
+</details>
 
 ## Usage
 
